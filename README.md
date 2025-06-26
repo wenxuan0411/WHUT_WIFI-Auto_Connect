@@ -27,7 +27,7 @@
 ```
 您的文件夹/
 ├── WiFi自动认证工具.exe      # 主程序
-├── msedgedriver.exe          # Edge驱动（需要下载）
+├── msedgedriver.exe          # Edge驱动（需要下载，压缩包内自带Version 137.0.3296.93 64位）
 └── config.txt                # 配置文件（自动生成）
 ```
 
@@ -227,4 +227,4 @@ wifi_ssid = WHUT-DORM       # WiFi名称，一般不需要修改
 
 **如有问题或建议，欢迎反馈！**
 
-最后更新：2024年6月 
+最后更新：2025年6月 
