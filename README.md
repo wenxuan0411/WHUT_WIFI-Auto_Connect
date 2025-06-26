@@ -61,8 +61,8 @@
 [SETTINGS]
 username = 您的用户名        # 填入校园卡卡号后六位的绝对值
 password = 您的密码          # 填入智慧校园密码
-portal_url = 您的密码           # 电脑连接WIFI时自动打开的网址
-wifi_ssid = WHUT-DORM      # WiFi名称，一般不需要修改
+portal_url = 您的密码        # 电脑连接WIFI时自动打开的网址
+wifi_ssid = WHUT-DORM       # WiFi名称，一般不需要修改
 ```
 
 **用户名说明**：
