@@ -1,0 +1,2 @@
+# WHUT_WIFI-Auto_Connect
+该项目基于Selenium自动连接WHUT校园网
