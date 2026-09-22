@@ -1,0 +1,21 @@
+# Build outputs and local test artifacts are distributed through GitHub Releases.
+/outputs/
+**/bin/
+**/obj/
+__pycache__/
+*.pyc
+*.log
+*.user
+*.suo
+
+# Never publish personal configuration, credentials, or captured portal responses.
+config.txt
+config.json
+settings.xml
+credentials.json
+credentials.dat
+portal_login_result*.html
+login_page*.html
+.venv*/
+.idea/
+.vscode/
