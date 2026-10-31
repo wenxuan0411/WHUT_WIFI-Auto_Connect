@@ -29,8 +29,23 @@ class Portal(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path).path
+        if path == "/api/r/default":
+            return self.reply(status=302, Location="/ok/login.html?nasId=14&ip=10.0.0.5&switchip=10.0.0.1&mac=aa%3Abb", **{"Set-Cookie": "portal_session=fixture; Path=/"})
+        if path == "/api/r/59":
+            return self.reply(status=302, Location="/nas59/login.html?nasId=59&ip=10.0.0.5&userip=10.0.0.5", **{"Set-Cookie": "portal_session=fixture; Path=/"})
+        if path == "/tpl/whut/login.html":
+            return self.reply('<script src="/ok/config.js"></script><script src="/ok/csrf.js"></script>')
         scenario, _, tail = path.lstrip("/").partition("/")
         if scenario == "probe":
+            if tail in ("campus", "campus-html", "campus-entry", "untrusted"):
+                location = f"http://127.0.0.1:{self.server.server_port}/tpl/whut/login.html?nasId=59&ip=10.0.0.5"
+                if tail == "campus-entry":
+                    location = f"http://127.0.0.1:{self.server.server_port}/api/r/59"
+                if tail == "untrusted":
+                    location = "http://example.invalid/tpl/whut/login.html?nasId=59"
+                if tail == "campus-html":
+                    return self.reply('<script>window.location.href = "' + location.replace('&','&amp;') + '";</script>')
+                return self.reply(status=302, Location=location)
             if tail == "redirect":
                 return self.reply(status=302, Location="/probe/ok")
             return self.reply({"ok": "Microsoft Connect Test\n", "portal": "<html>Microsoft Connect Test</html>", "empty": ""}.get(tail, "error"), 500 if tail == "error" else 200)
@@ -71,8 +86,10 @@ class Portal(http.server.BaseHTTPRequestHandler):
         data = self.rfile.read(int(self.headers["Content-Length"])).decode("utf-8")
         fields = urllib.parse.parse_qs(data, keep_blank_values=True)
         expected = {"username": ["test+user"], "password": ["p&=+% 密码"], "nasId": ["14"],
-                    "userIpv4": ["10.0.0.6" if scenario == "wlan" else "10.0.0.5"],
+                    "userIpv4": ["10.0.0.6" if scenario == "wlan" else ""],
                     "userMac": ["aa:bb"], "switchip": ["10.0.0.1"], "captcha": [""], "captchaId": [""]}
+        if scenario == "nas59":
+            expected.update(nasId=["59"], userMac=[""], switchip=[""])
         origin = f"http://127.0.0.1:{self.server.server_port}"
         valid = (self.path == f"/{scenario}/api/account/login" and fields == expected
                  and "portal_session=fixture" in self.headers.get("Cookie", "")
@@ -89,6 +106,8 @@ class Portal(http.server.BaseHTTPRequestHandler):
         if scenario == "badjson":
             return self.reply("<html>success</html>")
         result = {"code": {"denied": 1, "captcha": 2, "unknown": 99, "stringcode": "0"}.get(scenario, 0)}
+        if scenario.startswith("denied_"):
+            result = {"code": 1, "authMsg": {"denied_ip": "IP不在线", "denied_password": "密码错误", "denied_balance": "余额不足", "denied_limit": "在线数超限"}[scenario] + " private-detail"}
         if scenario == "falsezero":
             result["authMsg"] = "认证失败"
         self.reply(json.dumps(result))
@@ -110,7 +129,7 @@ def main():
     try:
         subprocess.run([str(exe), f"http://127.0.0.1:{server.server_port}"], check=True, timeout=60)
         assert not failures, f"Incorrect requests in scenarios: {failures}"
-        assert len(posts) == 10, f"Unexpected number of login POSTs: {len(posts)}"
+        assert len(posts) == 15, f"Unexpected number of login POSTs: {len(posts)}"
         assert "missingparams" not in posts
         print("PASS server-side request validation and POST count")
     finally:

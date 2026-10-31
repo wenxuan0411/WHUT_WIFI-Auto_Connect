@@ -17,8 +17,9 @@ using Microsoft.Win32;
 
 [assembly: AssemblyTitle("CampusFlow")]
 [assembly: AssemblyProduct("CampusFlow")]
-[assembly: AssemblyVersion("1314.5.4.0")]
-[assembly: AssemblyFileVersion("1314.5.4.0")]
+[assembly: AssemblyVersion("2.1.0.0")]
+[assembly: AssemblyFileVersion("2.1.0.0")]
+[assembly: AssemblyInformationalVersion("V2.1")]
 
 public sealed class PortalSettings
 {
@@ -81,6 +82,13 @@ static class AppData
                     var settings = (PortalSettings)new XmlSerializer(typeof(PortalSettings)).Deserialize(reader);
                     if (!xml.Contains("<NightMode>")) settings.NightMode = true;
                     if (!xml.Contains("<AutoDetect>")) settings.AutoDetect = false;
+                    string entry = PortalClient.NormalizePortalUrl(settings.PortalUrl);
+                    if (entry != settings.PortalUrl)
+                    {
+                        settings.PortalUrl = entry;
+                        SaveSettings(settings);
+                        Log("已将包含旧终端参数的登录页恢复为动态门户入口");
+                    }
                     return settings;
                 }
             }
@@ -132,27 +140,47 @@ static class BackgroundHost
     static System.Threading.Timer timer;
     static readonly object StateGate = new object();
     static bool checkQueued;
+    static bool stopping;
 
     internal static void Run()
     {
-        bool created;
-        using (var mutex = new Mutex(true, AppData.MutexName, out created))
+        using (var mutex = new Mutex(false, AppData.MutexName))
         {
-            if (!created) return;
-            bool stopCreated;
-            using (var stop = new EventWaitHandle(false, EventResetMode.ManualReset, AppData.StopEventName, out stopCreated))
+            bool acquired;
+            try { acquired = mutex.WaitOne(0); }
+            catch (AbandonedMutexException) { acquired = true; }
+            if (!acquired) { AppData.Log("后台启动被跳过：已有实例运行"); return; }
+            try
             {
-                stop.Reset();
-                NetworkChange.NetworkAvailabilityChanged += delegate { SetConnected(false); QueueCheck(3000); };
-                NetworkChange.NetworkAddressChanged += delegate { SetConnected(false); QueueCheck(3000); };
-                PortalSettings settings = AppData.LoadSettings();
-                int interval = Math.Max(20, Math.Min(3600, settings.CheckIntervalSeconds));
-                timer = new System.Threading.Timer(delegate { QueueCheck(0); }, null, 500, interval * 1000);
-                AppData.Log("后台服务已启动，未联网时检查间隔 " + interval + " 秒。");
-                stop.WaitOne();
-                timer.Dispose();
-                AppData.Log("后台服务已停止。");
+                bool stopCreated;
+                using (var stop = new EventWaitHandle(false, EventResetMode.ManualReset, AppData.StopEventName, out stopCreated))
+                {
+                    stop.Reset();
+                    NetworkAvailabilityChangedEventHandler availability = delegate { SetConnected(false); QueueCheck(3000); };
+                    NetworkAddressChangedEventHandler address = delegate { SetConnected(false); QueueCheck(3000); };
+                    NetworkChange.NetworkAvailabilityChanged += availability;
+                    NetworkChange.NetworkAddressChanged += address;
+                    PortalSettings settings = AppData.LoadSettings();
+                    int interval = Math.Max(20, Math.Min(3600, settings.CheckIntervalSeconds));
+                    lock (StateGate)
+                    {
+                        stopping = false;
+                        timer = new System.Threading.Timer(delegate { QueueCheck(0); }, null, 500, interval * 1000);
+                    }
+                    AppData.Log("后台服务已启动；版本=" + Assembly.GetExecutingAssembly().GetName().Version +
+                        "；PID=" + Process.GetCurrentProcess().Id + "；路径=" + Application.ExecutablePath +
+                        "；离线重试间隔=" + interval + "秒");
+                    try { stop.WaitOne(); }
+                    finally
+                    {
+                        NetworkChange.NetworkAvailabilityChanged -= availability;
+                        NetworkChange.NetworkAddressChanged -= address;
+                        lock (StateGate) { stopping = true; timer.Dispose(); timer = null; }
+                    }
+                    AppData.Log("后台服务已停止。");
+                }
             }
+            finally { mutex.ReleaseMutex(); }
         }
     }
 
@@ -160,7 +188,7 @@ static class BackgroundHost
     {
         lock (StateGate)
         {
-            if (checkQueued) return;
+            if (stopping || checkQueued) return;
             checkQueued = true;
         }
         ThreadPool.QueueUserWorkItem(delegate
@@ -168,10 +196,19 @@ static class BackgroundHost
             try
             {
                 if (delay > 0) Thread.Sleep(delay);
+                lock (StateGate) { if (stopping) return; }
+                var elapsed = Stopwatch.StartNew();
+                AppData.Log("开始检测校园 Wi-Fi 和认证状态");
                 PortalSettings settings = AppData.LoadSettings();
                 // 必须先扫描/连接目标 Wi-Fi；其他网络已联网也不能跳过此步骤。
                 string result = PortalClient.TryLogin(settings);
                 SetConnected(result == "认证成功" || result == "网络已经可以正常访问");
+                AppData.Log("检测完成：" + result + "；耗时=" + elapsed.Elapsed.TotalSeconds.ToString("F1") + "秒");
+            }
+            catch (Exception ex)
+            {
+                AppData.Log("后台检测异常，将继续重试：" + ex.GetType().Name);
+                SetConnected(false);
             }
             finally
             {
@@ -184,7 +221,7 @@ static class BackgroundHost
     {
         lock (StateGate)
         {
-            if (timer != null)
+            if (!stopping && timer != null)
             {
                 int intervalMs = Math.Max(20, Math.Min(3600, AppData.LoadSettings().CheckIntervalSeconds)) * 1000;
                 int next = value ? Math.Max(300000, intervalMs) : intervalMs;
@@ -207,10 +244,10 @@ static class StartupManager
 
     internal static void Enable()
     {
-        Stop();
+        if (!Stop()) { MessageBox.Show("旧后台尚未退出，请稍后重新启用。", "CampusFlow"); return; }
         using (RegistryKey key = Registry.CurrentUser.CreateSubKey(AppData.RunKey))
             key.SetValue(AppData.RunName, "\"" + Application.ExecutablePath + "\" --background");
-        Process.Start(Application.ExecutablePath, "--background");
+        StartBackground();
     }
 
     internal static void Disable()
@@ -223,15 +260,36 @@ static class StartupManager
     internal static void Restart()
     {
         if (!IsEnabled) return;
-        Stop();
-        Thread.Sleep(500);
-        Process.Start(Application.ExecutablePath, "--background");
+        if (Stop()) StartBackground();
     }
 
-    static void Stop()
+    internal static bool IsRunning { get { return !WaitForExit(AppData.MutexName, 0); } }
+
+    internal static bool WaitForExit(string mutexName, int timeout)
     {
-        try { EventWaitHandle.OpenExisting(AppData.StopEventName).Set(); }
-        catch { }
+        using (var mutex = new Mutex(false, mutexName))
+        {
+            bool acquired;
+            try { acquired = mutex.WaitOne(timeout); }
+            catch (AbandonedMutexException) { acquired = true; }
+            if (acquired) mutex.ReleaseMutex();
+            return acquired;
+        }
+    }
+
+    static void StartBackground()
+    {
+        Process.Start(new ProcessStartInfo(Application.ExecutablePath, "--background")
+        { UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden });
+    }
+
+    static bool Stop()
+    {
+        try { using (var stop = EventWaitHandle.OpenExisting(AppData.StopEventName)) stop.Set(); }
+        catch (WaitHandleCannotBeOpenedException) { }
+        bool exited = WaitForExit(AppData.MutexName, 10000);
+        if (!exited) AppData.Log("等待旧后台退出超时，未启动重复进程");
+        return exited;
     }
 
 }
@@ -305,7 +363,7 @@ sealed class GlassButton : Button
     {
         FlatStyle = FlatStyle.Flat;
         FlatAppearance.BorderSize = 0;
-        BackColor = Color.FromArgb(37, 139, 244);
+        BackColor = Color.FromArgb(24, 91, 165);
         ForeColor = Color.White;
         Cursor = Cursors.Hand;
         Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
@@ -368,12 +426,52 @@ sealed class GlassButton : Button
     }
 }
 
+sealed class PasswordEyeButton : Button
+{
+    internal bool Revealed;
+
+    internal PasswordEyeButton()
+    {
+        FlatStyle = FlatStyle.Flat;
+        FlatAppearance.BorderSize = 0;
+        UseVisualStyleBackColor = false;
+        Cursor = Cursors.Hand;
+        DoubleBuffered = true;
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        e.Graphics.Clear(BackColor);
+        e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        float x = Width / 2F, y = Height / 2F;
+        float scale = Font.Height / 17F;
+        e.Graphics.TranslateTransform(x, y);
+        e.Graphics.ScaleTransform(scale, scale);
+        using (var pen = new Pen(ForeColor, 1.5F))
+        {
+            e.Graphics.DrawBezier(pen, -8, 0, -4, -7, 4, -7, 8, 0);
+            e.Graphics.DrawBezier(pen, -8, 0, -4, 7, 4, 7, 8, 0);
+            e.Graphics.DrawEllipse(pen, -2.5F, -2.5F, 5, 5);
+            if (!Revealed) e.Graphics.DrawLine(pen, -8, 7, 8, -7);
+        }
+        e.Graphics.ResetTransform();
+        if (Focused && ShowFocusCues)
+            ControlPaint.DrawFocusRectangle(e.Graphics, Rectangle.Inflate(ClientRectangle, -2, -2), ForeColor, BackColor);
+    }
+}
+
 sealed class MainForm : Form
 {
     readonly Color TextMain = Color.FromArgb(243, 247, 252);
     readonly Color TextMuted = Color.FromArgb(169, 182, 198);
     readonly TextBox username = Input();
     readonly TextBox password = Input();
+    readonly PasswordEyeButton passwordToggle = new PasswordEyeButton();
+    readonly Panel passwordBox = new Panel { BorderStyle = BorderStyle.FixedSingle };
+    readonly Label credentialStatus = new Label();
+    readonly System.Windows.Forms.Timer credentialTimer = new System.Windows.Forms.Timer { Interval = 800 };
+    bool credentialChanged;
     readonly TextBox portalUrl = Input();
     readonly TextBox submitUrl = Input();
     readonly ComboBox method = new ComboBox();
@@ -387,7 +485,10 @@ sealed class MainForm : Form
     readonly CheckBox discoverRedirect = new CheckBox();
     readonly CheckBox autoDetect = new CheckBox();
     readonly Label status = new Label();
-    readonly TabControl tabs = new TabControl();
+    readonly System.Windows.Forms.Timer statusTimer = new System.Windows.Forms.Timer { Interval = 3000 };
+    readonly Panel pagesHost = new Panel { Dock = DockStyle.Fill };
+    readonly List<Panel> pages = new List<Panel>();
+    int selectedPage;
     readonly List<GlassButton> navigationButtons = new List<GlassButton>();
     readonly RichTextBox log = new RichTextBox();
     GlassButton themeButton;
@@ -409,7 +510,20 @@ sealed class MainForm : Form
         BuildHeader();
         BuildTabs();
         LoadValues();
+        username.TextChanged += delegate
+        {
+            // 不把上一个账号回填的密码自动保存到新账号。
+            password.Text = "";
+            SetPasswordVisible(false);
+            QueueCredentialSave();
+        };
+        password.TextChanged += delegate { QueueCredentialSave(); };
+        credentialTimer.Tick += delegate { SaveCredentialIfChanged(); };
+        FormClosing += delegate(object sender, FormClosingEventArgs e) { if (!SaveCredentialIfChanged()) e.Cancel = true; };
         UpdateStatus();
+        statusTimer.Tick += delegate { UpdateStatus(); };
+        statusTimer.Start();
+        FormClosed += delegate { statusTimer.Dispose(); credentialTimer.Dispose(); };
     }
 
     void TrySetIcon()
@@ -492,14 +606,11 @@ sealed class MainForm : Form
         var workspace = new Panel { Dock = DockStyle.Fill, BackColor = Color.FromArgb(18, 25, 35) };
         var navigation = new Panel { Dock = DockStyle.Top, Height = 58, Padding = new Padding(24, 10, 24, 10), BackColor = Color.FromArgb(22, 31, 43) };
 
-        tabs.Dock = DockStyle.Fill;
-        tabs.ItemSize = new Size(0, 1);
-        tabs.SizeMode = TabSizeMode.Fixed;
-        tabs.Appearance = TabAppearance.FlatButtons;
-        tabs.Controls.Add(BuildBasicPage());
-        tabs.Controls.Add(BuildAdvancedPage());
-        tabs.Controls.Add(BuildLogPage());
-        tabs.Controls.Add(BuildAboutPage());
+        pages.Add(BuildBasicPage());
+        pages.Add(BuildAdvancedPage());
+        pages.Add(BuildLogPage());
+        pages.Add(BuildAboutPage());
+        foreach (Panel page in pages) pagesHost.Controls.Add(page);
 
         string[] titles = { "基础设置", "高级设置", "运行日志", "关于" };
         for (int i = 0; i < titles.Length; i++)
@@ -518,31 +629,64 @@ sealed class MainForm : Form
             navigation.Controls.Add(button);
         }
 
-        workspace.Controls.Add(tabs);
+        workspace.Controls.Add(pagesHost);
         workspace.Controls.Add(navigation);
         Controls.Add(workspace);
         workspace.BringToFront();
+        SelectPage(0);
     }
 
     void SelectPage(int index)
     {
-        tabs.SelectedIndex = index;
-        for (int i = 0; i < navigationButtons.Count; i++)
-            navigationButtons[i].BackColor = i == index ? Color.FromArgb(42, 139, 236) : Color.FromArgb(48, 61, 78);
+        selectedPage = index;
+        for (int i = 0; i < pages.Count; i++) pages[i].Visible = i == index;
+        pages[index].BringToFront();
+        if (index == 2) LoadLog();
+        UpdateNavigationColors();
     }
 
-    TabPage BuildBasicPage()
+    void UpdateNavigationColors()
+    {
+        for (int i = 0; i < navigationButtons.Count; i++)
+        {
+            bool selected = i == selectedPage;
+            navigationButtons[i].BackColor = selected ? Color.FromArgb(24, 91, 165) :
+                (nightMode ? Color.FromArgb(48, 61, 78) : Color.FromArgb(214, 226, 239));
+            navigationButtons[i].ForeColor = selected || nightMode ? Color.White : Color.FromArgb(31, 41, 55);
+        }
+    }
+
+    Panel BuildBasicPage()
     {
         var page = Page("基础设置");
         var card = Card(28, 25, 825, 445);
         page.Controls.Add(card);
         AddField(card, "校园网账号", username, 28, 28, 360);
-        AddField(card, "密码", password, 428, 28, 360);
+        AddField(card, "密码", passwordBox, 428, 28, 360);
+        passwordBox.Height = username.Height;
+        passwordBox.Padding = new Padding(3, 0, 0, 0);
+        password.BorderStyle = BorderStyle.None;
         password.UseSystemPasswordChar = true;
+        passwordToggle.Dock = DockStyle.Right;
+        passwordToggle.Width = 32;
+        passwordToggle.AccessibleName = "显示密码";
+        passwordToggle.Click += delegate { SetPasswordVisible(password.UseSystemPasswordChar); };
+        passwordBox.Controls.Add(password);
+        passwordBox.Controls.Add(passwordToggle);
+        passwordBox.Layout += delegate
+        {
+            password.SetBounds(passwordBox.Padding.Left, Math.Max(0, (passwordBox.ClientSize.Height - password.PreferredHeight) / 2),
+                Math.Max(1, passwordBox.ClientSize.Width - passwordToggle.Width - passwordBox.Padding.Left * 2), password.PreferredHeight);
+        };
+        passwordBox.PerformLayout();
+        credentialStatus.Text = "账号密码输入后自动加密保存";
+        credentialStatus.AutoSize = true;
+        credentialStatus.Location = new Point(428, 86);
+        card.Controls.Add(credentialStatus);
         AddField(card, "登录页地址", portalUrl, 28, 105, 760);
         AddField(card, "认证接口（检查门户时自动读取）", submitUrl, 28, 182, 760);
 
-        var note = new Label { Text = "启用后自动扫描并连接 WHUT-DORM / WHUT-WLAN，再完成认证；请保持 Wi-Fi 开启。", ForeColor = TextMuted, AutoSize = true, Location = new Point(28, 250) };
+        var note = new Label { Text = "请填入校园网实际登录网址；设备编号会保留，终端 IP 每次重新获取。", ForeColor = TextMuted, AutoSize = true, Location = new Point(28, 250) };
         card.Controls.Add(note);
 
         autoDetect.Text = "武理专用认证：自动获取终端参数与 CSRF 令牌";
@@ -553,12 +697,12 @@ sealed class MainForm : Form
         autoDetect.Location = new Point(28, 276);
         card.Controls.Add(autoDetect);
 
-        var detect = new GlassButton { Text = "检查门户", Location = new Point(28, 310), Width = 120, BackColor = Color.FromArgb(68, 134, 204) };
+        var detect = new GlassButton { Text = "检查门户", Location = new Point(28, 310), Width = 120, BackColor = Color.FromArgb(24, 91, 165) };
         detect.Click += delegate { DetectLoginForm(detect); };
         card.Controls.Add(detect);
         var save = new GlassButton { Text = "保存并启用", Location = new Point(158, 310), Width = 145 };
         save.Click += delegate { SaveAndEnable(); };
-        var test = new GlassButton { Text = "测试登录", Location = new Point(315, 310), Width = 125, BackColor = Color.FromArgb(50, 185, 143) };
+        var test = new GlassButton { Text = "测试登录", Location = new Point(315, 310), Width = 125, BackColor = Color.FromArgb(18, 103, 77) };
         test.Click += delegate { TestLogin(test); };
         var disable = new GlassButton { Text = "停止后台", Location = new Point(450, 310), Width = 125, BackColor = Color.FromArgb(73, 84, 102) };
         disable.Click += delegate { StartupManager.Disable(); UpdateStatus(); MessageBox.Show("后台运行和开机启动已停止。", "CampusFlow"); };
@@ -571,7 +715,7 @@ sealed class MainForm : Form
         return page;
     }
 
-    TabPage BuildAdvancedPage()
+    Panel BuildAdvancedPage()
     {
         var page = Page("高级设置");
         var card = Card(28, 25, 825, 455);
@@ -612,7 +756,7 @@ sealed class MainForm : Form
         return page;
     }
 
-    TabPage BuildLogPage()
+    Panel BuildLogPage()
     {
         var page = Page("运行日志");
         var card = Card(28, 25, 825, 455);
@@ -630,11 +774,10 @@ sealed class MainForm : Form
         folder.Click += delegate { Directory.CreateDirectory(AppData.DirectoryPath); Process.Start("explorer.exe", AppData.DirectoryPath); };
         card.Controls.Add(refresh);
         card.Controls.Add(folder);
-        page.Enter += delegate { LoadLog(); };
         return page;
     }
 
-    TabPage BuildAboutPage()
+    Panel BuildAboutPage()
     {
         var page = Page("关于");
         var card = Card(52, 42, 775, 390);
@@ -651,7 +794,7 @@ sealed class MainForm : Form
             Size = new Size(62, 62)
         };
         var title = new Label { Text = "CampusFlow", ForeColor = TextMain, Font = new Font("Microsoft YaHei UI", 20F, FontStyle.Bold), AutoSize = true, Location = new Point(122, 43) };
-        var version = new Label { Text = "WHUT 1314.5.4.0  ·  Windows 10 / 11", ForeColor = TextMuted, AutoSize = true, Location = new Point(125, 82) };
+        var version = new Label { Text = "WHUT V2.1  ·  Windows 10 / 11", ForeColor = TextMuted, AutoSize = true, Location = new Point(125, 82) };
         var description = new Label
         {
             Text = "基于 CampusFlow 的武汉理工大学校园网适配版。\r\n支持门户动态参数、Cookie 与 CSRF 认证，以及断网后的自动重试。\r\n无需 Edge 或驱动；原项目作者信息保留如下。",
@@ -681,9 +824,10 @@ sealed class MainForm : Form
         return page;
     }
 
-    static TabPage Page(string title)
+    static Panel Page(string title)
     {
-        return new TabPage(title) { BackColor = Color.FromArgb(18, 25, 35), Padding = new Padding(0) };
+        return new Panel { Text = title, BackColor = Color.FromArgb(18, 25, 35),
+            Size = new Size(898, 506), Dock = DockStyle.Fill };
     }
 
     RoundPanel Card(int x, int y, int width, int height)
@@ -726,8 +870,51 @@ sealed class MainForm : Form
         nightMode = settings.NightMode;
         ApplyTheme();
         string[] credentials = AppData.LoadCredential();
-        if (credentials != null) username.Text = credentials[0];
-        password.Text = "";
+        if (credentials != null)
+        {
+            username.Text = credentials[0];
+            password.Text = credentials[1];
+            credentialStatus.Text = "";
+        }
+    }
+
+    void SetPasswordVisible(bool visible)
+    {
+        password.UseSystemPasswordChar = !visible;
+        passwordToggle.Revealed = visible;
+        passwordToggle.AccessibleName = visible ? "隐藏密码" : "显示密码";
+        passwordToggle.Invalidate();
+    }
+
+    void QueueCredentialSave()
+    {
+        credentialChanged = true;
+        credentialTimer.Stop();
+        credentialTimer.Start();
+        credentialStatus.Text = "输入完成后自动保存";
+    }
+
+    bool SaveCredentialIfChanged()
+    {
+        credentialTimer.Stop();
+        if (!credentialChanged) return true;
+        if (String.IsNullOrWhiteSpace(username.Text) || password.Text.Length == 0)
+        {
+            credentialStatus.Text = "请填全账号和密码；已存凭据保留";
+            return true;
+        }
+        try
+        {
+            AppData.SaveCredential(username.Text.Trim(), password.Text);
+            credentialChanged = false;
+            credentialStatus.Text = "账号密码已自动加密保存";
+            return true;
+        }
+        catch
+        {
+            credentialStatus.Text = "密码保存失败，请检查本地目录权限";
+            return false;
+        }
     }
 
     void PutSettings(PortalSettings settings)
@@ -754,7 +941,7 @@ sealed class MainForm : Form
     {
         return new PortalSettings
         {
-            PortalUrl = portalUrl.Text.Trim(),
+            PortalUrl = PortalClient.NormalizePortalUrl(portalUrl.Text.Trim()),
             SubmitUrl = submitUrl.Text.Trim(),
             Method = method.SelectedItem == null ? "POST" : method.SelectedItem.ToString(),
             UsernameField = usernameField.Text.Trim(),
@@ -795,7 +982,7 @@ sealed class MainForm : Form
 
     void DetectLoginForm(Control button)
     {
-        string address = portalUrl.Text.Trim();
+        PortalSettings settings = ReadSettings();
         button.Enabled = false;
         ThreadPool.QueueUserWorkItem(delegate
         {
@@ -803,7 +990,7 @@ sealed class MainForm : Form
             string api = null;
             try
             {
-                PortalClient.PortalContext context = PortalClient.DiscoverPortal(address);
+                PortalClient.PortalContext context = PortalClient.DiscoverPortal(settings);
                 api = new Uri(context.ApiUrl, "account/login").AbsoluteUri;
                 message = "已读取学校认证接口及令牌。检查门户不会提交账号密码。";
             }
@@ -872,14 +1059,14 @@ sealed class MainForm : Form
 
         BackColor = pageColor;
         ApplyThemeToControls(Controls, pageColor, panelColor, inputColor, mainText, mutedText);
-        for (int i = 0; i < navigationButtons.Count; i++)
-            navigationButtons[i].BackColor = i == tabs.SelectedIndex ? Color.FromArgb(42, 139, 236) : (nightMode ? Color.FromArgb(48, 61, 78) : Color.FromArgb(214, 226, 239));
+        UpdateNavigationColors();
         if (themeButton != null)
         {
             themeButton.Text = nightMode ? "☀ 日间模式" : "☾ 夜间模式";
             themeButton.BackColor = nightMode ? Color.FromArgb(48, 61, 78) : Color.FromArgb(214, 226, 239);
             themeButton.ForeColor = mainText;
         }
+        UpdateStatus();
         Invalidate(true);
     }
 
@@ -896,7 +1083,12 @@ sealed class MainForm : Form
             }
             else if (glassButton != null)
             {
-                glassButton.ForeColor = mainText;
+                glassButton.ForeColor = Color.White;
+            }
+            else if (control == passwordBox || control == passwordToggle)
+            {
+                control.BackColor = inputColor;
+                control.ForeColor = mainText;
             }
             else if (control is Button)
             {
@@ -917,7 +1109,7 @@ sealed class MainForm : Form
                 control.ForeColor = mainText;
                 control.BackColor = Color.Transparent;
             }
-            else if (control is TabPage)
+            else if (control == pagesHost || pages.Contains(control as Panel))
             {
                 control.BackColor = pageColor;
             }
@@ -936,8 +1128,10 @@ sealed class MainForm : Form
 
     void UpdateStatus()
     {
-        status.Text = StartupManager.IsEnabled ? "● 后台已启用" : "○ 后台未启用";
-        status.ForeColor = StartupManager.IsEnabled ? Color.FromArgb(134, 239, 172) : TextMuted;
+        bool running = StartupManager.IsRunning;
+        status.Text = running ? "● 后台运行中" : (StartupManager.IsEnabled ? "○ 已设自启，未运行" : "○ 后台未启用");
+        status.ForeColor = running ? (nightMode ? Color.FromArgb(134, 239, 172) : Color.FromArgb(20, 109, 57)) :
+            (nightMode ? TextMuted : Color.FromArgb(91, 105, 122));
     }
 
     void LoadLog()
